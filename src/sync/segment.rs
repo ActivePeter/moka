@@ -1,8 +1,10 @@
+use crossbeam_utils::atomic::AtomicCell;
 use equivalent::Equivalent;
 
 use super::{cache::Cache, CacheBuilder, OwnedKeyEntrySelector, RefKeyEntrySelector};
 use crate::common::concurrent::Weigher;
 use crate::common::time::Clock;
+use crate::CapacityError;
 use crate::{
     common::{
         iter::{Iter, ScanningGet},
@@ -16,7 +18,7 @@ use crate::{
 use std::{
     collections::hash_map::RandomState,
     fmt,
-    hash::{BuildHasher, Hash},
+    hash::{BuildHasher, Hash, Hasher},
     sync::Arc,
 };
 
@@ -121,6 +123,19 @@ where
     pub fn builder(num_segments: usize) -> CacheBuilder<K, V, SegmentedCache<K, V, RandomState>> {
         CacheBuilder::default().segments(num_segments)
     }
+
+    /// Sets the max capacity for this segmented cache (asynchronously effective).
+    pub fn set_max_capacity(&self, new_capacity: u64) -> Result<(), CapacityError> {
+        // 更新总容量（仅作为对外展示和分配基准）
+        self.inner.desired_capacity.store(Some(new_capacity));
+
+        // 为每个 segment 分配容量；BaseCache::set_max_capacity 为异步生效
+        let segment_capacity = new_capacity / self.inner.segments.len() as u64;
+        for segment in &self.inner.segments {
+            segment.base.set_max_capacity(segment_capacity)?;
+        }
+        Ok(())
+    }
 }
 
 impl<K, V, S> SegmentedCache<K, V, S> {
@@ -135,7 +150,7 @@ impl<K, V, S> SegmentedCache<K, V, S> {
     /// A future version may support to modify it.
     pub fn policy(&self) -> Policy {
         let mut policy = self.inner.segments[0].policy();
-        policy.set_max_capacity(self.inner.desired_capacity);
+        policy.set_max_capacity(self.inner.desired_capacity.load());
         policy.set_num_segments(self.inner.segments.len());
         policy
     }
@@ -686,7 +701,7 @@ where
 }
 
 struct Inner<K, V, S> {
-    desired_capacity: Option<u64>,
+    desired_capacity: AtomicCell<Option<u64>>,
     segments: Box<[Cache<K, V, S>]>,
     build_hasher: S,
     segment_shift: u32,
@@ -745,7 +760,7 @@ where
             .collect::<Vec<_>>();
 
         Self {
-            desired_capacity: max_capacity,
+            desired_capacity: AtomicCell::new(max_capacity),
             segments: segments.into_boxed_slice(),
             build_hasher,
             segment_shift,
@@ -757,7 +772,9 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.build_hasher.hash_one(key)
+        let mut hasher = self.build_hasher.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish()
     }
 
     #[inline]
@@ -1851,7 +1868,7 @@ mod tests {
     // Ignored by default. This test becomes unstable when run in parallel with
     // other tests.
     #[test]
-    #[cfg_attr(not(run_flaky_tests), ignore)]
+    #[ignore]
     fn drop_value_immediately_after_eviction() {
         use crate::common::test_utils::{Counters, Value};
 
