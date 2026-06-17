@@ -8,12 +8,7 @@
 [![codecov][codecov-badge]][codecov]
 [![license][license-badge]](#license)
 
-> [!NOTE]
-> If you have any questions about Moka's APIs or internal design, you can ask the
-> AI chatbot at DeepWiki in a natural language:
-> <https://deepwiki.com/moka-rs/moka>
-
-> [!NOTE]
+> **note**
 > `v0.12.0` had major breaking changes on the API and internal behavior. Please read
 > the [MIGRATION-GUIDE.md][migration-guide-v012] for the details.
 
@@ -90,7 +85,7 @@ The following table shows the trade-offs between the different cache implementat
 | Per-entry variable expiration | ✅ | ❌ | ❌ |
 | Eviction listener | ✅ | ❌ | ✅ (via lifecycle hook) |
 | Lock-free, concurrent iterator | ✅ | ❌ | ❌ |
-| Lock-per-shard, concurrent iterator | ❌ | ✅ | ✅ |
+| Lock-per-shard, concurrent iterator | ❌ | ✅ | ❌ |
 
 | Performance, etc. | Moka v0.12 | Mini Moka v0.10 | Quick Cache v0.6 |
 |:------- |:---- |:--------- |:----------- |
@@ -122,7 +117,7 @@ routers. Here are some highlights:
 
 ## Recent Changes
 
-> [!NOTE]
+> **Note**
 > `v0.12.0` had major breaking changes on the API and internal behavior. Please read
 > the [MIGRATION-GUIDE.md][migration-guide-v012] for the details.
 
@@ -472,10 +467,10 @@ section ([`sync::Cache`][doc-sync-cache-expiration],
 
 Moka's minimum supported Rust versions (MSRV) are the followings:
 
-| Feature  | MSRV                         |
-|:---------|:----------------------------:|
-| `future` | Rust 1.71.1 (August 3, 2023) |
-| `sync`   | Rust 1.71.1 (August 3, 2023) |
+| Feature  | MSRV                       |
+|:---------|:--------------------------:|
+| `future` | Rust 1.70.0 (June 1, 2023) |
+| `sync`   | Rust 1.70.0 (June 1, 2023) |
 
 It will keep a rolling MSRV policy of at least 6 months. If the default features with
 a mandatory features (`future` or `sync`) are enabled, MSRV will be updated
@@ -485,10 +480,7 @@ to the latest stable.
 In both cases, increasing MSRV is _not_ considered a semver-breaking change.
 
 <!--
-> Be conservative with MSRV, dependency versions and semver breaks
-https://rust-team.pages.debian.net/book/upstream.html
-
-https://salsa.debian.org/rust-team/debcargo-conf/-/tree/master/src/moka/debian
+- quanta v0.12.4 requires 1.70.0.
 -->
 
 ## Troubleshooting

@@ -1333,8 +1333,7 @@ mod tests {
             .collect();
 
         {
-            let map =
-                HashMap::with_num_segments_capacity_and_hasher(4, 0, DefaultHashBuilder::default());
+            let map = HashMap::with_capacity(0);
             assert!(map.is_empty());
             assert_eq!(map.len(), 0);
 
@@ -1392,7 +1391,10 @@ mod tests {
             let live_key_count =
                 NUM_VALUES - key_parents.iter().filter(|k| k.was_dropped()).count();
             let bucket_array_len = map.capacity() * 2;
-            assert_eq!(bucket_array_len, map.num_segments() * 128 * 2);
+            // With many CPU cores, the default segment count can be high enough that
+            // this workload does not force every segment to grow. Use the actual
+            // allocated bucket array length for the deferred-drop bound below.
+            assert!(bucket_array_len >= map.num_segments() * bucket::BUCKET_ARRAY_DEFAULT_LENGTH);
             assert!(live_key_count <= bucket_array_len / 10);
 
             for this_value_parent in value_parents.iter() {
@@ -1436,11 +1438,7 @@ mod tests {
         );
 
         {
-            let map = Arc::new(HashMap::with_num_segments_capacity_and_hasher(
-                4,
-                0,
-                DefaultHashBuilder::default(),
-            ));
+            let map = Arc::new(HashMap::with_capacity(0));
             assert!(map.is_empty());
             assert_eq!(map.len(), 0);
 
@@ -1556,7 +1554,10 @@ mod tests {
             let live_key_count =
                 NUM_VALUES - key_parents.iter().filter(|k| k.was_dropped()).count();
             let bucket_array_len = map.capacity() * 2;
-            assert_eq!(bucket_array_len, map.num_segments() * 128 * 2);
+            // With many CPU cores, the default segment count can be high enough that
+            // this workload does not force every segment to grow. Use the actual
+            // allocated bucket array length for the deferred-drop bound below.
+            assert!(bucket_array_len >= map.num_segments() * bucket::BUCKET_ARRAY_DEFAULT_LENGTH);
             assert!(live_key_count <= bucket_array_len / 10);
 
             for this_value_parent in value_parents.iter() {

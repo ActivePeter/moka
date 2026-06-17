@@ -19,6 +19,7 @@ use crate::{
             WriteOp,
         },
         deque::{DeqNode, Deque},
+        error::CapacityError,
         frequency_sketch::FrequencySketch,
         iter::ScanningGet,
         time::{AtomicInstant, Clock, Instant},
@@ -38,7 +39,7 @@ use smallvec::SmallVec;
 use std::{
     borrow::Borrow,
     collections::hash_map::RandomState,
-    hash::{BuildHasher, Hash},
+    hash::{BuildHasher, Hash, Hasher},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -96,7 +97,7 @@ impl<K, V, S> BaseCache<K, V, S> {
     }
 
     pub(crate) fn is_map_disabled(&self) -> bool {
-        self.inner.max_capacity == Some(0)
+        *self.inner.max_capacity.read() == Some(0)
     }
 
     #[inline]
@@ -115,6 +116,25 @@ impl<K, V, S> BaseCache<K, V, S> {
         V: Clone + Send + Sync + 'static,
     {
         self.inner.notify_invalidate(key, entry);
+    }
+
+    /// Sets the max capacity for this cache (asynchronously effective).
+    ///
+    /// This method updates the internal `max_capacity` immediately on the
+    /// cache state so future maintenance rounds (housekeeper) will evict to
+    /// the new limit when needed. It does not enqueue a write-op nor force an
+    /// immediate eviction; the change takes effect asynchronously.
+    pub(crate) fn set_max_capacity(&self, new_capacity: u64) -> Result<(), CapacityError>
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        // Directly apply capacity change to the inner state. This avoids
+        // channel backpressure entirely; eviction will be driven by the
+        // normal maintenance loop.
+        let _needs_eviction = self.inner.update_max_capacity(new_capacity);
+        Ok(())
     }
 }
 
@@ -572,29 +592,15 @@ where
         if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
             (&self.inner.expiration_policy.expiry(), &upd_op)
         {
-            // Check if the old entry was expired by per-entry TTL.
-            // If so, this is semantically a "create" (re-inserting after expiration),
-            // not an "update".
-            let old_expired_by_per_entry_ttl = old_info
-                .entry
-                .entry_info()
-                .expiration_state()
-                .0
-                .is_some_and(|exp_time| exp_time <= ts);
-
-            if old_expired_by_per_entry_ttl {
-                Self::expire_after_create(expiry, &key, value_entry, ts, self.inner.clock());
-            } else {
-                Self::expire_after_read_or_update(
-                    |k, v, t, d| expiry.expire_after_update(k, v, t, d),
-                    &key,
-                    value_entry,
-                    self.inner.expiration_policy.time_to_live(),
-                    self.inner.expiration_policy.time_to_idle(),
-                    ts,
-                    self.inner.clock(),
-                );
-            }
+            Self::expire_after_read_or_update(
+                |k, v, t, d| expiry.expire_after_update(k, v, t, d),
+                &key,
+                value_entry,
+                self.inner.expiration_policy.time_to_live(),
+                self.inner.expiration_policy.time_to_idle(),
+                ts,
+                self.inner.clock(),
+            );
         }
 
         if self.is_removal_notifier_enabled() {
@@ -692,20 +698,17 @@ impl<K, V, S> BaseCache<K, V, S> {
         let current_time = clock.to_std_instant(ts);
         let ei = &value_entry.entry_info();
 
-        // Track the current per-entry expiration time.
-        let current_per_entry_exp_time = ei.expiration_state().0;
-
         let exp_time = IntoIterator::into_iter([
-            current_per_entry_exp_time,
+            ei.expiration_time(),
             ttl.and_then(|dur| ei.last_modified().map(|ts| ts.saturating_add(dur))),
             tti.and_then(|dur| ei.last_accessed().map(|ts| ts.saturating_add(dur))),
         ])
         .flatten()
         .min();
 
-        let current_duration = exp_time.map(|time| {
+        let current_duration = exp_time.and_then(|time| {
             let std_time = clock.to_std_instant(time);
-            std_time.saturating_duration_since(current_time)
+            std_time.checked_duration_since(current_time)
         });
 
         let duration = expiry(key, &value_entry.value, current_time, current_duration);
@@ -871,7 +874,7 @@ type CacheStore<K, V, S> = crate::cht::SegmentedHashMap<Arc<K>, MiniArc<ValueEnt
 
 pub(crate) struct Inner<K, V, S> {
     name: Option<String>,
-    max_capacity: Option<u64>,
+    pub(crate) max_capacity: RwLock<Option<u64>>,
     entry_count: AtomicCell<u64>,
     weighted_size: AtomicCell<u64>,
     pub(crate) cache: CacheStore<K, V, S>,
@@ -918,7 +921,12 @@ impl<K, V, S> Inner<K, V, S> {
 
     fn policy(&self) -> Policy {
         let exp = &self.expiration_policy;
-        Policy::new(self.max_capacity, 1, exp.time_to_live(), exp.time_to_idle())
+        Policy::new(
+            self.max_capacity.read().clone(),
+            1,
+            exp.time_to_live(),
+            exp.time_to_idle(),
+        )
     }
 
     #[inline]
@@ -1052,7 +1060,7 @@ where
 
         Self {
             name,
-            max_capacity,
+            max_capacity: RwLock::new(max_capacity),
             entry_count: AtomicCell::default(),
             weighted_size: AtomicCell::default(),
             cache,
@@ -1079,7 +1087,9 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.build_hasher.hash_one(key)
+        let mut hasher = self.build_hasher.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish()
     }
 
     #[inline]
@@ -1184,7 +1194,7 @@ where
         max_log_sync_repeats: u32,
         eviction_batch_size: u32,
     ) -> bool {
-        if self.max_capacity == Some(0) {
+        if *self.max_capacity.read() == Some(0) {
             return false;
         }
 
@@ -1328,20 +1338,21 @@ where
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
     fn has_enough_capacity(&self, candidate_weight: u32, counters: &EvictionCounters) -> bool {
-        self.max_capacity.map_or(true, |limit| {
+        self.max_capacity.read().map_or(true, |limit| {
             counters.weighted_size + candidate_weight as u64 <= limit
         })
     }
 
     fn weights_to_evict(&self, counters: &EvictionCounters) -> u64 {
         self.max_capacity
+            .read()
             .map(|limit| counters.weighted_size.saturating_sub(limit))
             .unwrap_or_default()
     }
 
     #[inline]
     fn should_enable_frequency_sketch(&self, counters: &EvictionCounters) -> bool {
-        match self.max_capacity {
+        match *self.max_capacity.read() {
             None | Some(0) => false,
             Some(max_cap) => {
                 if self.frequency_sketch_enabled.load(Ordering::Acquire) {
@@ -1355,7 +1366,7 @@ where
 
     #[inline]
     fn enable_frequency_sketch(&self, counters: &EvictionCounters) {
-        if let Some(max_cap) = self.max_capacity {
+        if let Some(max_cap) = *self.max_capacity.read() {
             let c = counters;
             let cap = if self.weigher.is_none() {
                 max_cap
@@ -1368,7 +1379,7 @@ where
 
     #[cfg(test)]
     fn enable_frequency_sketch_for_testing(&self) {
-        if let Some(max_cap) = self.max_capacity {
+        if let Some(max_cap) = *self.max_capacity.read() {
             self.do_enable_frequency_sketch(max_cap);
         }
     }
@@ -1378,6 +1389,41 @@ where
         let skt_capacity = common::sketch_capacity(cache_capacity);
         self.frequency_sketch.write().ensure_capacity(skt_capacity);
         self.frequency_sketch_enabled.store(true, Ordering::Release);
+    }
+
+    /// Updates the max capacity and adjusts the frequency sketch accordingly.
+    /// If the new capacity is less than the current weighted size, this will
+    /// trigger eviction by returning true.
+    fn update_max_capacity(&self, new_capacity: u64) -> bool {
+        let old_capacity = {
+            let mut cap = self.max_capacity.write();
+            let old = *cap;
+            *cap = Some(new_capacity);
+            old
+        };
+
+        // Adjust frequency sketch capacity
+        if new_capacity > 0 {
+            let skt_capacity = common::sketch_capacity(new_capacity);
+            self.frequency_sketch.write().ensure_capacity(skt_capacity);
+
+            // Enable frequency sketch if not already enabled and we have enough entries
+            if !self.frequency_sketch_enabled.load(Ordering::Acquire) {
+                let weighted_size = self.weighted_size.load();
+                if weighted_size >= new_capacity / 2 {
+                    self.frequency_sketch_enabled.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        // Determine if we need to trigger eviction
+        if let Some(old) = old_capacity {
+            if new_capacity < old {
+                let current_size = self.weighted_size.load();
+                return current_size > new_capacity;
+            }
+        }
+        false
     }
 
     fn apply_reads(&self, deqs: &mut Deques<K>, timer_wheel: &mut TimerWheel<K>, count: usize) {
@@ -1412,8 +1458,7 @@ where
     ) where
         V: Clone,
     {
-        use WriteOp::{Remove, Upsert};
-        let freq = self.frequency_sketch.read();
+        use WriteOp::{Remove, SetCapacity, Upsert};
         let ch = &self.write_op_ch;
 
         for _ in 0..count {
@@ -1424,17 +1469,20 @@ where
                     entry_gen: gen,
                     old_weight,
                     new_weight,
-                }) => self.handle_upsert(
-                    kh,
-                    entry,
-                    gen,
-                    old_weight,
-                    new_weight,
-                    deqs,
-                    timer_wheel,
-                    &freq,
-                    eviction_state,
-                ),
+                }) => {
+                    let freq = self.frequency_sketch.read();
+                    self.handle_upsert(
+                        kh,
+                        entry,
+                        gen,
+                        old_weight,
+                        new_weight,
+                        deqs,
+                        timer_wheel,
+                        &freq,
+                        eviction_state,
+                    );
+                }
                 Ok(Remove {
                     kv_entry: KvEntry { key: _key, entry },
                     entry_gen: gen,
@@ -1446,6 +1494,15 @@ where
                         Some(gen),
                         &mut eviction_state.counters,
                     );
+                }
+                Ok(SetCapacity { new_capacity }) => {
+                    // Update the capacity and check if eviction is needed
+                    let needs_eviction = self.update_max_capacity(new_capacity);
+
+                    // If eviction is needed, set the flag to trigger eviction
+                    if needs_eviction {
+                        eviction_state.more_entries_to_evict = true;
+                    }
                 }
                 Err(_) => break,
             };
@@ -1490,7 +1547,7 @@ where
             }
         }
 
-        if let Some(max) = self.max_capacity {
+        if let Some(max) = *self.max_capacity.read() {
             if new_weight as u64 > max {
                 // The candidate is too big to fit in the cache. Reject it.
 
@@ -1729,19 +1786,16 @@ where
         entry: &MiniArc<ValueEntry<K, V>>,
         timer_wheel: &mut TimerWheel<K>,
     ) {
-        // Atomically read both expiration_time and expiry_gen as a single unit
-        // to ensure consistent state and avoid TOCTOU issues.
-        let (expiration_time, current_expiry_gen) = entry.entry_info().expiration_state();
         // Enable the timer wheel if needed.
-        if expiration_time.is_some() && !timer_wheel.is_enabled() {
+        if entry.entry_info().expiration_time().is_some() && !timer_wheel.is_enabled() {
             timer_wheel.enable();
         }
 
-        // Get timer_node with its expiry generation to detect stale pointers.
-        let (timer_node, expected_expiry_gen) = entry.timer_node_with_expiry_gen();
-
         // Update the timer wheel.
-        match (expiration_time.is_some(), timer_node) {
+        match (
+            entry.entry_info().expiration_time().is_some(),
+            entry.timer_node(),
+        ) {
             // Do nothing; the cache entry has no expiration time and not registered
             // to the timer wheel.
             (false, None) => (),
@@ -1751,39 +1805,26 @@ where
                 let timer = timer_wheel.schedule(
                     MiniArc::clone(entry.entry_info()),
                     MiniArc::clone(entry.deq_nodes()),
-                    current_expiry_gen,
                 );
-                entry.set_timer_node(timer, current_expiry_gen);
+                entry.set_timer_node(timer);
             }
             // Reschedule the cache entry in the timer wheel; the cache entry has an
             // expiration time and already registered to the timer wheel.
             (true, Some(tn)) => {
-                // Reschedule with generation validation to prevent use-after-free
-                match timer_wheel.reschedule(tn, expected_expiry_gen) {
-                    Some(ReschedulingResult::Removed(removed_tn)) => {
-                        // The timer node was removed from the timer wheel because the
-                        // expiration time has been unset by other thread after we
-                        // checked.
-                        entry.set_timer_node(None, current_expiry_gen);
-                        drop(removed_tn);
-                    }
-                    Some(ReschedulingResult::Rescheduled) => {
-                        // Successfully rescheduled, nothing to do.
-                    }
-                    None => {
-                        // The timer node was invalid (stale - expiry gen mismatch).
-                        // Clear the timer_node to prevent further issues.
-                        entry.set_timer_node(None, current_expiry_gen);
-                    }
+                let result = timer_wheel.reschedule(tn);
+                if let ReschedulingResult::Removed(removed_tn) = result {
+                    // The timer node was removed from the timer wheel because the
+                    // expiration time has been unset by other thread after we
+                    // checked.
+                    entry.set_timer_node(None);
+                    drop(removed_tn);
                 }
             }
             // Unregister the cache entry from the timer wheel; the cache entry has
             // no expiration time but registered to the timer wheel.
             (false, Some(tn)) => {
-                entry.set_timer_node(None, current_expiry_gen);
-                // Returns false if the node was stale, but we've already
-                // cleared timer_node above, so we can ignore the return value.
-                let _ = timer_wheel.deschedule(tn, expected_expiry_gen);
+                entry.set_timer_node(None);
+                timer_wheel.deschedule(tn);
             }
         }
     }
@@ -1795,12 +1836,8 @@ where
         gen: Option<u16>,
         counters: &mut EvictionCounters,
     ) {
-        // Take the timer node along with its stored expiry generation for validation.
-        let (timer_node, expiry_gen) = entry.take_timer_node();
-        if let Some(tn) = timer_node {
-            // Returns false if the node was stale, but we've already
-            // taken (cleared) the timer_node, so we can ignore the return value.
-            let _ = timer_wheel.deschedule(tn, expiry_gen);
+        if let Some(timer_node) = entry.take_timer_node() {
+            timer_wheel.deschedule(timer_node);
         }
         Self::handle_remove_without_timer_wheel(deqs, entry, gen, counters);
     }
@@ -1833,13 +1870,8 @@ where
         entry: MiniArc<ValueEntry<K, V>>,
         counters: &mut EvictionCounters,
     ) {
-        // Take the timer node along with its stored expiry generation for validation.
-        let (timer_node, expiry_gen) = entry.take_timer_node();
-        if let Some(timer) = timer_node {
-            // Deschedule with generation validation to prevent use-after-free.
-            // Returns false if the node was stale, but we've already
-            // taken (cleared) the timer_node, so we can ignore the return value.
-            let _ = timer_wheel.deschedule(timer, expiry_gen);
+        if let Some(timer) = entry.take_timer_node() {
+            timer_wheel.deschedule(timer);
         }
         if entry.is_admitted() {
             entry.set_admitted(false);
@@ -2428,7 +2460,7 @@ where
 /// Returns `true` if this entry is expired by its per-entry TTL.
 #[inline]
 fn is_expired_by_per_entry_ttl<K>(entry_info: &MiniArc<EntryInfo<K>>, now: Instant) -> bool {
-    if let Some(ts) = entry_info.expiration_state().0 {
+    if let Some(ts) = entry_info.expiration_time() {
         ts <= now
     } else {
         false
@@ -2639,36 +2671,6 @@ mod tests {
             };
         }
 
-        /// Helper function to compare Duration values with tolerance for precision loss.
-        /// Due to precision loss from bit packing (lower 12 bits cleared), durations may be
-        /// off by up to ~4 microseconds.
-        fn assert_duration_approx_eq(
-            actual: Option<Duration>,
-            expected: Option<Duration>,
-            caller_line: u32,
-        ) {
-            const TOLERANCE: Duration = Duration::from_micros(10);
-            match (actual, expected) {
-                (Some(a), Some(e)) => {
-                    let diff = if a > e { a - e } else { e - a };
-                    assert!(
-                        diff < TOLERANCE,
-                        "Mismatched `current_duration`s. line: {}\n  left: {:?}\n right: {:?}",
-                        caller_line,
-                        a,
-                        e
-                    );
-                }
-                _ => {
-                    assert_eq!(
-                        actual, expected,
-                        "Mismatched `current_duration`s. line: {}",
-                        caller_line
-                    );
-                }
-            }
-        }
-
         macro_rules! assert_expiry {
             ($cache:ident, $key:ident, $hash:ident, $mock:ident, $duration_secs:expr) => {
                 // Increment the time.
@@ -2850,10 +2852,11 @@ mod tests {
                             "current_time",
                             caller_line
                         );
-                        assert_duration_approx_eq(
+                        assert_params_eq!(
                             actual_current_duration,
                             current_duration_secs.map(Duration::from_secs),
-                            caller_line,
+                            "current_duration",
+                            caller_line
                         );
                         assert_params_eq!(
                             actual_last_modified_at,
@@ -2900,10 +2903,11 @@ mod tests {
                             "current_time",
                             caller_line
                         );
-                        assert_duration_approx_eq(
+                        assert_params_eq!(
                             actual_current_duration,
                             current_duration_secs.map(Duration::from_secs),
-                            caller_line,
+                            "current_duration",
+                            caller_line
                         );
                         new_duration_secs.map(Duration::from_secs)
                     }

@@ -1,123 +1,6 @@
 # Moka Cache &mdash; Change Log
 
-> [!NOTE]
-> If you have any questions about Moka's APIs or internal design, you can ask the
-> AI chatbot at DeepWiki in a natural language:
-> <https://deepwiki.com/moka-rs/moka>
-
-## Version 0.12.15
-
-### Fixed
-
-- Fixed a bug where re-inserting an expired entry could cause it to lose its
-  expiration time and remain in the cache indefinitely when using a custom `Expiry`
-  policy with per-entry expiration. ([#582][gh-pull-0582] by [@jiangzhe][gh-jiangzhe],
-  [#581][gh-pull-0581] by [@atrocities][gh-atrocities], reported in
-  [#575][gh-issue-0575]):
-    - This occurred when an entry that had expired but not yet been evicted was
-      re-inserted, and `expire_after_update` returned `None`. This primarily
-      affected users who only override `expire_after_create`, since the default
-      `expire_after_update` returns `duration_until_expiry`, which is `None` for
-      expired entries.
-    - This bug was introduced by the changes in v0.12.13 ([#549][gh-pull-0549] and
-      [#564][gh-pull-0564]).
-    - **Subtle behavior change**:
-        - Before this fix, re-inserting an expired entry was treated as an update,
-          so `Expiry::expire_after_update` was called.
-        - After this fix, re-inserting an expired entry is treated as a creation,
-          so `Expiry::expire_after_create` is called instead.
-        - This may change the expiration time of re-inserted entries, depending on
-          your `Expiry` trait implementation.
-- Fixed flaky tests `cht::segment::tests::drop_many_values` and
-  `drop_many_values_concurrent` that were failing on high-core-count machines
-  ([#586][gh-pull-0586]):
-    - These tests were using a CPU-dependent segment count, causing inconsistent
-      bucket array shrinking behavior of the internal segmented hash map across
-      different machines.
-    - Changed these tests to use a fixed segment count (4) for consistent results.
-
-### Changed
-
-- Disabled flaky GC-dependent tests by default using `run_flaky_tests` cfg
-  ([#584][gh-pull-0584]):
-    - These tests rely on epoch-based garbage collection (`crossbeam-epoch`) timing
-      that is not guaranteed, causing intermittent failures.
-    - Fixed [#539][gh-issue-0539] and [#580][gh-issue-0580].
-    - To run these tests, set `RUSTFLAGS='--cfg run_flaky_tests'`.
-
-## Version 0.12.14
-
-### Fixed
-
-- Fixed a race condition in the `and_compute_with` method in the `future::Cache`.
-  ([#574][gh-pull-0574] by [@Squadrick][gh-Squadrick]):
-    - When multiple calls are made concurrently for the same key, the `f` closure may
-      read a stale value, causing the first update to be lost when it is overwritten
-      by a later one.
-
-### Changed
-
-- Use `dep:` keyword in the crate features. ([#577][gh-pull-0577] by
-  [@alexanderkjall][gh-alexanderkjall]).
-
-## Version 0.12.13
-
-### Fixed
-
-- Fixed/mitigated use-after-free issues in the hierarchical timer wheels when `Expiry`
-  returns `None` (Issue [#565][gh-issue-0565], reported by
-  [@sharksforarms][gh-sharksforarms]).
-    - Fixed a bug that caused freed timer nodes to remain in the timer wheels in
-      some edge cases ([#566][gh-pull-0566] by [@powergee][gh-powergee]).
-    - The mitigation added to v0.12.12 was enhanced by atomically reading the
-      expiration state to prevent rare race conditions that could cause use-after-free
-      issues ([#570][gh-pull-0570]).
-- Fixed `Expiry::expire_after_update` not clearing expiration time for expired entries
-  (`future::Cache`: [#549][gh-pull-0549], by [@singulared][gh-singulared],
-  `sync::Cache`: [#564][gh-pull-0564]).
-
-
-## Version 0.12.12
-
-Bumped the minimum supported Rust version (MSRV) to 1.71.1, released on August 3,
-2023 ([#555][gh-pull-0555]).
-
-### Fixed
-
-- Mitigated use-after-free issues in the hierarchical timer wheels when `Expiry`
-  returns `None` ([#548][gh-pull-0548], by [@awarus][gh-awarus]).
-- Fixed a subtle undefined behavior in the internal `deque::move_to_back` method
-  (found by Miri) ([#553][gh-pull-0553]).
-
-### Added
-
-- `impl Expiry` for some types ([#519][gh-pull-0519], by [@koushiro][gh-koushiro]).
-
-### Removed
-
-- Removed several unneeded files from the published package ([#541][gh-pull-0541],
-  by [@weiznich][gh-weiznich]).
-- Removed the `once_cell` crate from the dependencies ([#520][gh-pull-0520], by
-  [@Expyron][gh-Expyron]).
-- Removed the `rustc_version` crate from the dev-dependencies ([#554][gh-pull-0554]).
-
-
 ## Version 0.12.11
-
-### Breaking Changes
-
-- After releasing v0.12.11, we found that supporting `Equivalent` trait was an
-  unintended breaking change.
-    - If you get a compilation error something like following, please update your
-      code to reborrow the key like `&*key`.
-        - ```console
-          error[E0277]: the trait bound `T: Borrow<Arc<T>>` is not satisfied
-          ...
-          = note: required for `Arc<T>` to implement `Equivalent<T>`
-          ```
-    - See [this PR comment][gh-pull-0492-breaking-change] for more details.
-
-[gh-pull-0492-breaking-change]: https://github.com/moka-rs/moka/pull/492/#issuecomment-3621308432
 
 ### Added
 
@@ -1082,20 +965,14 @@ The minimum supported Rust version (MSRV) is now 1.51.0 (Mar 25, 2021).
 [RUSTSEC-2020-0168]: https://rustsec.org/advisories/RUSTSEC-2020-0168.html
 
 [gh-06chaynes]: https://github.com/06chaynes
-[gh-alexanderkjall]: https://github.com/alexanderkjall
 [gh-arcstur]: https://github.com/arcstur
 [gh-aspect]: https://github.com/aspect
-[gh-atrocities]: https://github.com/atrocities
-[gh-awarus]: https://github.com/awarus
 [gh-barkanido]: https://github.com/barkanido
 [gh-brownjohnf]: https://github.com/brownjohnf
 [gh-ClSlaid]: https://github.com/ClSlaid
 [gh-eaufavor]: https://github.com/eaufavor
-[gh-Expyron]: https://github.com/Expyron
 [gh-JoJoDeveloping]: https://github.com/JoJoDeveloping
-[gh-jiangzhe]: https://github.com/jiangzhe
 [gh-karankurbur]: https://github.com/karankurbur
-[gh-koushiro]: https://github.com/koushiro
 [gh-LMJW]: https://github.com/LMJW
 [gh-messense]: https://github.com/messense
 [gh-Milo123459]: https://github.com/Milo123459
@@ -1103,24 +980,15 @@ The minimum supported Rust version (MSRV) is now 1.51.0 (Mar 25, 2021).
 [gh-nyurik]: https://github.com/nyurik
 [gh-paolobarbolini]: https://github.com/paolobarbolini
 [gh-peter-scholtens]: https://github.com/peter-scholtens
-[gh-powergee]: https://github.com/powergee
 [gh-qti3e]: https://github.com/qti3e
 [gh-quantpoet]: https://github.com/quantpoet
 [gh-saethlin]: https://github.com/saethlin
-[gh-sharksforarms]: https://github.com/sharksforarms
-[gh-singulared]: https://github.com/singulared
-[gh-Squadrick]: https://github.com/Squadrick
 [gh-Swatinem]: https://github.com/Swatinem
 [gh-thomaseizinger]: https://github.com/thomaseizinger
 [gh-tinou98]: https://github.com/tinou98
-[gh-weiznich]: https://github.com/weiznich
 [gh-xuehaonan27]: https://github.com/xuehaonan27
 [gh-zonyitoo]: https://github.com/zonyitoo
 
-[gh-issue-0580]: https://github.com/moka-rs/moka/issues/580/
-[gh-issue-0575]: https://github.com/moka-rs/moka/issues/575/
-[gh-issue-0565]: https://github.com/moka-rs/moka/issues/565/
-[gh-issue-0539]: https://github.com/moka-rs/moka/issues/539/
 [gh-issue-0472]: https://github.com/moka-rs/moka/issues/472/
 [gh-issue-0464]: https://github.com/moka-rs/moka/issues/464/
 [gh-issue-0412]: https://github.com/moka-rs/moka/issues/412/
@@ -1146,27 +1014,10 @@ The minimum supported Rust version (MSRV) is now 1.51.0 (Mar 25, 2021).
 [gh-issue-0034]: https://github.com/moka-rs/moka/issues/34/
 [gh-issue-0031]: https://github.com/moka-rs/moka/issues/31/
 
-[gh-pull-0586]: https://github.com/moka-rs/moka/pull/586/
-[gh-pull-0584]: https://github.com/moka-rs/moka/pull/584/
-[gh-pull-0582]: https://github.com/moka-rs/moka/pull/582/
-[gh-pull-0581]: https://github.com/moka-rs/moka/pull/581/
-[gh-pull-0577]: https://github.com/moka-rs/moka/pull/577/
-[gh-pull-0574]: https://github.com/moka-rs/moka/pull/574/
-[gh-pull-0570]: https://github.com/moka-rs/moka/pull/570/
-[gh-pull-0566]: https://github.com/moka-rs/moka/pull/566/
-[gh-pull-0564]: https://github.com/moka-rs/moka/pull/564/
-[gh-pull-0555]: https://github.com/moka-rs/moka/pull/555/
-[gh-pull-0554]: https://github.com/moka-rs/moka/pull/554/
-[gh-pull-0553]: https://github.com/moka-rs/moka/pull/553/
-[gh-pull-0549]: https://github.com/moka-rs/moka/pull/549/
-[gh-pull-0548]: https://github.com/moka-rs/moka/pull/548/
-[gh-pull-0541]: https://github.com/moka-rs/moka/pull/541/
 [gh-pull-0534]: https://github.com/moka-rs/moka/pull/534/
 [gh-pull-0532]: https://github.com/moka-rs/moka/pull/532/
 [gh-pull-0531]: https://github.com/moka-rs/moka/pull/531/
 [gh-pull-0529]: https://github.com/moka-rs/moka/pull/529/
-[gh-pull-0520]: https://github.com/moka-rs/moka/pull/520/
-[gh-pull-0519]: https://github.com/moka-rs/moka/pull/519/
 [gh-pull-0514]: https://github.com/moka-rs/moka/pull/514/
 [gh-pull-0512]: https://github.com/moka-rs/moka/pull/512/
 [gh-pull-0509]: https://github.com/moka-rs/moka/pull/509/

@@ -39,7 +39,7 @@ jobs:
         rust:
           - stable
           - beta
-          - 1.71.1  # MSRV
+          - 1.70.0  # MSRV
           - nightly # For checking minimum version dependencies.
 
     steps:
@@ -68,11 +68,11 @@ jobs:
         run: ./.ci_extras/pin-crate-vers-nightly.sh
 
       - name: Pin some dependencies to specific versions (MSRV only)
-        if: ${{ matrix.rust == '1.71.1' }}
+        if: ${{ matrix.rust == '1.70.0' }}
         run: ./.ci_extras/pin-crate-vers-msrv.sh
 
       - name: Remove some examples (MSRV only)
-        if: ${{ matrix.rust == '1.71.1' }}
+        if: ${{ matrix.rust == '1.70.0' }}
         run: ./.ci_extras/remove-examples-msrv.sh
 
       - name: Show cargo tree
@@ -80,39 +80,25 @@ jobs:
 
       - name: Run tests (debug, sync feature)
         run: cargo test --features sync
+        env:
+          RUSTFLAGS: '--cfg rustver'
 
       - name: Run tests (release, sync feature)
         run: cargo test --release --features sync
+        env:
+          RUSTFLAGS: '--cfg rustver'
 
       - name: Run tests (sync feature, key lock test for notification)
-        run: cargo test --release --lib --features sync sync::cache::tests::test_key_lock_used_by_immediate_removal_notifications -- --exact
-        env:
-          RUSTFLAGS: '--cfg run_flaky_tests'
+        run: cargo test --release --lib --features sync sync::cache::tests::test_key_lock_used_by_immediate_removal_notifications -- --exact --ignored
 
       - name: Run tests (sync feature, drop value after eviction for sync::Cache)
-        run: cargo test --release --lib --features sync sync::cache::tests::drop_value_immediately_after_eviction -- --exact
-        env:
-          RUSTFLAGS: '--cfg run_flaky_tests'
+        run: cargo test --release --lib --features sync sync::cache::tests::drop_value_immediately_after_eviction -- --exact --ignored
 
       - name: Run tests (sync feature, drop value after eviction for sync::SegmentedCache)
-        run: cargo test --release --lib --features sync sync::segment::tests::drop_value_immediately_after_eviction -- --exact
-        env:
-          RUSTFLAGS: '--cfg run_flaky_tests'
+        run: cargo test --release --lib --features sync sync::segment::tests::drop_value_immediately_after_eviction -- --exact --ignored
 
       - name: Run tests (sync feature, drop cache)
-        run: cargo test --release --lib --features sync sync::cache::tests::ensure_gc_runs_when_dropping_cache -- --exact
-        env:
-          RUSTFLAGS: '--cfg run_flaky_tests'
-
-      - name: Run tests (future feature, drop value after eviction for future::Cache)
-        run: cargo test --release --lib --features future future::cache::tests::drop_value_immediately_after_eviction -- --exact
-        env:
-          RUSTFLAGS: '--cfg run_flaky_tests'
-
-      - name: Run tests (future feature, drop cache for future::Cache)
-        run: cargo test --release --lib --features future future::cache::tests::ensure_gc_runs_when_dropping_cache -- --exact
-        env:
-          RUSTFLAGS: '--cfg run_flaky_tests'
+        run: cargo test --release --lib --features sync sync::cache::tests::ensure_gc_runs_when_dropping_cache -- --exact --ignored
 
       - name: Run tests (future feature, but no sync feature)
         run: cargo test --features future

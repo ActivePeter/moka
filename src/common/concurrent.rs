@@ -140,9 +140,6 @@ pub(crate) struct DeqNodes<K> {
     access_order_q_node: Option<KeyDeqNodeAo<K>>,
     write_order_q_node: Option<KeyDeqNodeWo<K>>,
     timer_node: Option<DeqNodeTimer<K>>,
-    /// The expiry generation when timer_node was set.
-    /// Used to validate the timer_node hasn't become stale.
-    timer_node_expiry_gen: u32,
 }
 
 impl<K> Default for DeqNodes<K> {
@@ -151,7 +148,6 @@ impl<K> Default for DeqNodes<K> {
             access_order_q_node: None,
             write_order_q_node: None,
             timer_node: None,
-            timer_node_expiry_gen: 0,
         }
     }
 }
@@ -160,13 +156,8 @@ impl<K> Default for DeqNodes<K> {
 unsafe impl<K> Send for DeqNodes<K> {}
 
 impl<K> DeqNodes<K> {
-    pub(crate) fn set_timer_node(&mut self, timer_node: Option<DeqNodeTimer<K>>, expiry_gen: u32) {
+    pub(crate) fn set_timer_node(&mut self, timer_node: Option<DeqNodeTimer<K>>) {
         self.timer_node = timer_node;
-        self.timer_node_expiry_gen = expiry_gen;
-    }
-
-    pub(crate) fn timer_node_with_expiry_gen(&self) -> (Option<DeqNodeTimer<K>>, u32) {
-        (self.timer_node, self.timer_node_expiry_gen)
     }
 }
 
@@ -247,21 +238,16 @@ impl<K, V> ValueEntry<K, V> {
         self.nodes.lock().write_order_q_node.take()
     }
 
-    /// Returns the timer node and its expected expiry generation for validation.
-    pub(crate) fn timer_node_with_expiry_gen(&self) -> (Option<DeqNodeTimer<K>>, u32) {
-        self.nodes.lock().timer_node_with_expiry_gen()
+    pub(crate) fn timer_node(&self) -> Option<DeqNodeTimer<K>> {
+        self.nodes.lock().timer_node
     }
 
-    pub(crate) fn set_timer_node(&self, node: Option<DeqNodeTimer<K>>, expiry_gen: u32) {
-        self.nodes.lock().set_timer_node(node, expiry_gen);
+    pub(crate) fn set_timer_node(&self, node: Option<DeqNodeTimer<K>>) {
+        self.nodes.lock().timer_node = node;
     }
 
-    /// Takes the timer node and returns it along with its stored expiry generation.
-    pub(crate) fn take_timer_node(&self) -> (Option<DeqNodeTimer<K>>, u32) {
-        let mut nodes = self.nodes.lock();
-        let expiry_gen = nodes.timer_node_expiry_gen;
-        nodes.timer_node_expiry_gen = 0;
-        (nodes.timer_node.take(), expiry_gen)
+    pub(crate) fn take_timer_node(&self) -> Option<DeqNodeTimer<K>> {
+        self.nodes.lock().timer_node.take()
     }
 
     pub(crate) fn unset_q_nodes(&self) {
@@ -322,6 +308,9 @@ pub(crate) enum WriteOp<K, V> {
         kv_entry: KvEntry<K, V>,
         entry_gen: u16,
     },
+    SetCapacity {
+        new_capacity: u64,
+    },
 }
 
 /// Cloning a `WriteOp` is safe and cheap because it uses `Arc` and `MiniArc` pointers to
@@ -349,6 +338,9 @@ impl<K, V> Clone for WriteOp<K, V> {
                 kv_entry: kv_entry.clone(),
                 entry_gen: *entry_gen,
             },
+            Self::SetCapacity { new_capacity } => Self::SetCapacity {
+                new_capacity: *new_capacity,
+            },
         }
     }
 }
@@ -358,6 +350,10 @@ impl<K, V> fmt::Debug for WriteOp<K, V> {
         match self {
             Self::Upsert { .. } => f.debug_struct("Upsert").finish(),
             Self::Remove { .. } => f.debug_tuple("Remove").finish(),
+            Self::SetCapacity { new_capacity } => f
+                .debug_struct("SetCapacity")
+                .field("new_capacity", new_capacity)
+                .finish(),
         }
     }
 }
