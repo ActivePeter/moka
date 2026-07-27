@@ -136,6 +136,33 @@ impl<K, V, S> BaseCache<K, V, S> {
         let _needs_eviction = self.inner.update_max_capacity(new_capacity);
         Ok(())
     }
+
+    /// Removes the capacity boundary without walking or rebuilding the cache.
+    /// Existing entries and recency metadata remain intact.
+    pub(crate) fn clear_max_capacity(&self)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        self.inner.clear_max_capacity();
+    }
+
+    /// Evicts entries with `RemovalCause::Size` until at least the requested
+    /// weight has been removed, or no more progress can be made.
+    ///
+    /// This is a one-shot operation and does not change `max_capacity`.
+    pub(crate) fn evict_some(&self, weight_to_evict: u64) -> u64
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        self.housekeeper
+            .as_ref()
+            .map(|housekeeper| housekeeper.evict_some(self.inner.as_ref(), weight_to_evict))
+            .unwrap_or(0)
+    }
 }
 
 impl<K, V, S> BaseCache<K, V, S>
@@ -1168,13 +1195,32 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
+    type Key = K;
+    type Value = V;
+
     fn run_pending_tasks(
         &self,
         timeout: Option<Duration>,
         max_log_sync_repeats: u32,
         eviction_batch_size: u32,
     ) -> bool {
-        self.do_run_pending_tasks(timeout, max_log_sync_repeats, eviction_batch_size)
+        self.do_run_pending_tasks(timeout, max_log_sync_repeats, eviction_batch_size, 0)
+            .0
+    }
+
+    fn evict_some(
+        &self,
+        weight_to_evict: u64,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> (bool, u64) {
+        self.do_run_pending_tasks(
+            timeout,
+            max_log_sync_repeats,
+            eviction_batch_size,
+            weight_to_evict,
+        )
     }
 
     fn now(&self) -> Instant {
@@ -1193,11 +1239,8 @@ where
         timeout: Option<Duration>,
         max_log_sync_repeats: u32,
         eviction_batch_size: u32,
-    ) -> bool {
-        if *self.max_capacity.read() == Some(0) {
-            return false;
-        }
-
+        requested_eviction_weight: u64,
+    ) -> (bool, u64) {
         // Acquire some locks.
         let mut deqs = self.deques.lock();
         let mut timer_wheel = self.timer_wheel.lock();
@@ -1213,6 +1256,7 @@ where
         let current_ws = self.weighted_size.load();
         let mut eviction_state =
             EvictionState::new(current_ec, current_ws, self.removal_notifier.as_ref());
+        let mut explicitly_evicted_weight = 0u64;
 
         loop {
             if should_process_logs {
@@ -1277,15 +1321,19 @@ where
             }
 
             // Evict if this cache has more entries than its capacity.
-            let weights_to_evict = self.weights_to_evict(&eviction_state.counters);
+            let capacity_weight_to_evict = self.weights_to_evict(&eviction_state.counters);
+            let requested_weight_to_evict =
+                requested_eviction_weight.saturating_sub(explicitly_evicted_weight);
+            let weights_to_evict = capacity_weight_to_evict.max(requested_weight_to_evict);
             if weights_to_evict > 0 {
-                self.evict_lru_entries(
-                    &mut deqs,
-                    &mut timer_wheel,
-                    eviction_batch_size,
-                    weights_to_evict,
-                    &mut eviction_state,
-                );
+                explicitly_evicted_weight =
+                    explicitly_evicted_weight.saturating_add(self.evict_lru_entries(
+                        &mut deqs,
+                        &mut timer_wheel,
+                        eviction_batch_size,
+                        weights_to_evict,
+                        &mut eviction_state,
+                    ));
             }
 
             // Check whether to continue this loop or not.
@@ -1324,7 +1372,10 @@ where
         // Ensure the deqs lock is held until here.
         drop(deqs);
 
-        eviction_state.more_entries_to_evict
+        (
+            eviction_state.more_entries_to_evict,
+            explicitly_evicted_weight,
+        )
     }
 }
 
@@ -1424,6 +1475,12 @@ where
             }
         }
         false
+    }
+
+    fn clear_max_capacity(&self) {
+        *self.max_capacity.write() = None;
+        self.frequency_sketch_enabled
+            .store(false, Ordering::Release);
     }
 
     fn apply_reads(&self, deqs: &mut Deques<K>, timer_wheel: &mut TimerWheel<K>, count: usize) {
@@ -2268,7 +2325,8 @@ where
         batch_size: u32,
         weights_to_evict: u64,
         eviction_state: &mut EvictionState<'_, K, V>,
-    ) where
+    ) -> u64
+    where
         V: Clone,
     {
         const CACHE_REGION: CacheRegion = CacheRegion::MainProbation;
@@ -2355,6 +2413,7 @@ where
         if more_to_evict {
             eviction_state.more_entries_to_evict = true;
         }
+        evicted
     }
 }
 

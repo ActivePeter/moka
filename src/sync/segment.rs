@@ -136,6 +136,14 @@ where
         }
         Ok(())
     }
+
+    /// Removes the aggregate capacity boundary without scanning entries.
+    pub fn clear_max_capacity(&self) {
+        self.inner.desired_capacity.store(None);
+        for segment in &self.inner.segments {
+            segment.base.clear_max_capacity();
+        }
+    }
 }
 
 impl<K, V, S> SegmentedCache<K, V, S> {
@@ -209,6 +217,57 @@ impl<K, V, S> SegmentedCache<K, V, S> {
             .iter()
             .map(|seg| seg.weighted_size())
             .sum()
+    }
+
+    /// Evicts some entries using each segment's LRU eviction order.
+    ///
+    /// `weight_to_evict` is the requested amount to remove, rather than a target
+    /// cache size. The returned value is the weight actually evicted and can be
+    /// larger than requested because entries are removed whole. This operation
+    /// does not change the configured maximum capacity.
+    pub fn evict_some(&self, weight_to_evict: u64) -> u64
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        if weight_to_evict == 0 {
+            return 0;
+        }
+
+        self.run_pending_tasks();
+        let segment_weights = self
+            .inner
+            .segments
+            .iter()
+            .map(Cache::weighted_size)
+            .collect::<Vec<_>>();
+        let mut remaining_available_weight = segment_weights.iter().copied().sum::<u64>();
+        let mut remaining_requested_weight = weight_to_evict.min(remaining_available_weight);
+        let mut evicted_weight = 0u64;
+
+        for (segment, segment_weight) in self.inner.segments.iter().zip(segment_weights.into_iter())
+        {
+            if remaining_requested_weight == 0 || remaining_available_weight == 0 {
+                break;
+            }
+            if segment_weight == 0 {
+                continue;
+            }
+
+            let numerator = u128::from(remaining_requested_weight) * u128::from(segment_weight);
+            let denominator = u128::from(remaining_available_weight);
+            let share = u64::try_from((numerator + denominator - 1) / denominator)
+                .unwrap_or(u64::MAX)
+                .min(remaining_requested_weight)
+                .min(segment_weight);
+            let segment_evicted = segment.base.evict_some(share);
+            evicted_weight = evicted_weight.saturating_add(segment_evicted);
+            remaining_requested_weight = remaining_requested_weight.saturating_sub(segment_evicted);
+            remaining_available_weight = remaining_available_weight.saturating_sub(segment_weight);
+        }
+
+        evicted_weight
     }
 }
 
@@ -816,6 +875,82 @@ mod tests {
         assert!(!cache.contains_key(&0));
         assert!(cache.get(&0).is_none());
         assert_eq!(cache.entry_count(), 0)
+    }
+
+    #[test]
+    fn evict_some_removes_requested_weight_without_changing_capacity() {
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let notifications_for_listener = Arc::clone(&notifications);
+        let listener = move |key, value, cause| {
+            notifications_for_listener.lock().push((key, value, cause));
+        };
+        let cache = SegmentedCache::builder(1)
+            .max_capacity(100)
+            .weigher(|_key: &&str, value: &u32| *value)
+            .eviction_listener(listener)
+            .build();
+
+        for key in ["a", "b", "c", "d", "e"] {
+            cache.insert(key, 10);
+        }
+        cache.run_pending_tasks();
+        assert_eq!(cache.weighted_size(), 50);
+
+        let evicted_weight = cache.evict_some(21);
+
+        assert_eq!(evicted_weight, 30);
+        assert_eq!(cache.weighted_size(), 20);
+        assert_eq!(cache.policy().max_capacity(), Some(100));
+        let notifications = notifications.lock();
+        assert_eq!(notifications.len(), 3);
+        assert!(notifications
+            .iter()
+            .all(|(_, _, cause)| *cause == RemovalCause::Size));
+    }
+
+    #[test]
+    fn evict_some_handles_zero_and_more_than_current_weight() {
+        let cache = SegmentedCache::new(100, 4);
+        for key in 0..32 {
+            cache.insert(key, ());
+        }
+        cache.run_pending_tasks();
+        let initial_weight = cache.weighted_size();
+        assert_eq!(initial_weight, 32);
+
+        assert_eq!(cache.evict_some(0), 0);
+        assert_eq!(cache.weighted_size(), initial_weight);
+
+        assert_eq!(cache.evict_some(u64::MAX), initial_weight);
+        assert_eq!(cache.weighted_size(), 0);
+        assert_eq!(cache.policy().max_capacity(), Some(100));
+    }
+
+    #[test]
+    fn evict_some_reinserted_entry_moves_behind_other_lru_entries() {
+        let evicted_keys = Arc::new(Mutex::new(Vec::new()));
+        let evicted_keys_for_listener = Arc::clone(&evicted_keys);
+        let cache = SegmentedCache::builder(1)
+            .max_capacity(100)
+            .eviction_listener(move |key, _value, cause| {
+                if cause == RemovalCause::Size {
+                    evicted_keys_for_listener.lock().push(*key);
+                }
+            })
+            .build();
+        cache.insert("a", ());
+        cache.insert("b", ());
+        cache.insert("c", ());
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.evict_some(1), 1);
+        assert_eq!(&*evicted_keys.lock(), &["a"]);
+
+        cache.insert("a", ());
+        cache.run_pending_tasks();
+        assert_eq!(cache.evict_some(1), 1);
+        assert_eq!(&*evicted_keys.lock(), &["a", "b"]);
+        assert!(cache.contains_key(&"a"));
     }
 
     #[test]

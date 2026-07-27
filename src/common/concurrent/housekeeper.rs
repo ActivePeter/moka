@@ -11,6 +11,9 @@ use std::{
 };
 
 pub(crate) trait InnerSync {
+    type Key;
+    type Value;
+
     /// Runs the pending tasks. Returns `true` if there are more entries to evict in
     /// next run.
     fn run_pending_tasks(
@@ -19,6 +22,16 @@ pub(crate) trait InnerSync {
         max_log_sync_repeats: u32,
         eviction_batch_size: u32,
     ) -> bool;
+
+    /// Runs maintenance while also evicting at least the requested weight when
+    /// possible. Returns `(more_entries_to_evict, evicted_weight)`.
+    fn evict_some(
+        &self,
+        weight_to_evict: u64,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> (bool, u64);
 
     fn now(&self) -> Instant;
 }
@@ -114,6 +127,23 @@ impl Housekeeper {
         } else {
             false
         }
+    }
+
+    pub(crate) fn evict_some<T: InnerSync>(&self, cache: &T, weight_to_evict: u64) -> u64 {
+        if weight_to_evict == 0 {
+            return 0;
+        }
+        let _lock = self.run_lock.lock();
+        let now = cache.now();
+        self.run_after.set_instant(Self::sync_after(now));
+        let (more_to_evict, evicted_weight) = cache.evict_some(
+            weight_to_evict,
+            self.maintenance_task_timeout,
+            self.max_log_sync_repeats,
+            self.eviction_batch_size,
+        );
+        self.set_more_entries_to_evict(more_to_evict);
+        evicted_weight
     }
 
     fn do_run_pending_tasks<T: InnerSync>(&self, cache: &T, _lock: MutexGuard<'_, ()>) {

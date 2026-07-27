@@ -773,6 +773,20 @@ where
         self.base.set_max_capacity(new_capacity)
     }
 
+    /// Evicts some entries using the cache's LRU eviction order.
+    ///
+    /// `weight_to_evict` is the requested amount to remove, rather than a target
+    /// cache size. The returned value is the weight actually evicted and can be
+    /// larger than requested because entries are removed whole. This operation
+    /// does not change the configured maximum capacity.
+    pub fn evict_some(&self, weight_to_evict: u64) -> u64 {
+        if weight_to_evict == 0 {
+            return 0;
+        }
+        self.run_pending_tasks();
+        self.base.evict_some(weight_to_evict)
+    }
+
     /// Returns `true` if the cache contains a value for the key.
     ///
     /// Unlike the `get` method, this method is not considered a cache read operation,
