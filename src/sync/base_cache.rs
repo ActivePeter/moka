@@ -196,11 +196,11 @@ where
         invalidator_enabled: bool,
         clock: Clock,
     ) -> Self {
-        let (r_size, w_size) = if max_capacity == Some(0) {
-            (0, 0)
-        } else {
-            (READ_LOG_CH_SIZE, WRITE_LOG_CH_SIZE)
-        };
+        // A zero-born cache can later grow through set_max_capacity. Keep
+        // buffered logs: a zero-capacity channel cannot make progress with
+        // schedule_write_op's try_send and maintenance's nonblocking drain.
+        // is_map_disabled still rejects admissions while the budget is zero.
+        let (r_size, w_size) = (READ_LOG_CH_SIZE, WRITE_LOG_CH_SIZE);
         let is_eviction_listener_enabled = eviction_listener.is_some();
         let fast_now = clock.fast_now();
 

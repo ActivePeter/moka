@@ -1943,6 +1943,38 @@ mod tests {
     }
 
     #[test]
+    fn zero_born_dynamic_capacity_reopens_without_stalling() {
+        let cache = Cache::<u32, u32>::new(0);
+        let write_log_capacity = cache.base.write_op_ch.capacity();
+        cache.insert(0, 0);
+        assert_eq!(cache.get(&0), None);
+        cache.set_max_capacity(10).unwrap();
+
+        // A broken zero-capacity write log spins forever in schedule_write_op.
+        // Bound this regression even on the old implementation.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            cache.insert(1, 1);
+            cache.run_pending_tasks();
+            assert_eq!(cache.get(&1), Some(1));
+            assert_eq!(cache.weighted_size(), 1);
+            cache.set_max_capacity(0).unwrap();
+            cache.run_pending_tasks();
+            assert_eq!(cache.entry_count(), 0);
+            cache.set_max_capacity(10).unwrap();
+            cache.insert(2, 2);
+            cache.run_pending_tasks();
+            assert_eq!(cache.get(&2), Some(2));
+            assert_eq!(cache.weighted_size(), 1);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|err| {
+            panic!("zero-born cache made no write progress: write_log={write_log_capacity:?}, error={err}")
+        });
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn basic_single_thread() {
         // The following `Vec`s will hold actual and expected notifications.
         let actual = Arc::new(Mutex::new(Vec::new()));
